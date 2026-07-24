@@ -27,10 +27,35 @@ PRICE_DECIMALS = {
     "ETHUSDT": 2,
 }
 
+# Quantity precision per symbol (Binance LOT_SIZE stepSize). Pine's str.tostring()
+# can send quantities with tiny floating-point noise (e.g. 0.010000000000000002)
+# which Binance rejects outright with a 400 -- so we always re-round server-side
+# before an order ever goes out, regardless of what Pine sent.
+QTY_DECIMALS = {
+    "BTCUSDT": 3,
+    "ETHUSDT": 3,
+}
+
+# Safety ceiling per entry leg. This is intentionally small -- meant to catch a
+# fat-fingered Pine input (e.g. 1 instead of 0.01) before it ever reaches
+# Binance, not to be a real position-sizing limit. Raise these deliberately if
+# you actually want to trade bigger size.
+MAX_QTY = {
+    "BTCUSDT": 0.05,
+    "ETHUSDT": 0.5,
+}
+
 
 def round_price(symbol, price):
     decimals = PRICE_DECIMALS.get(symbol, 2)
     return round(price, decimals)
+
+
+def format_qty(symbol, qty):
+    """Returns a clean fixed-decimal string, e.g. '0.010', never scientific
+    notation or long floating-point tails."""
+    decimals = QTY_DECIMALS.get(symbol, 3)
+    return f"{round(float(qty), decimals):.{decimals}f}"
 
 
 def signed_request(method, endpoint, params=None):
@@ -76,22 +101,26 @@ def place_market_order(symbol, side, qty, reduce_only=False):
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": qty,
+        "quantity": format_qty(symbol, qty),
     }
     if reduce_only:
         params["reduceOnly"] = "true"
     return signed_request("POST", "/fapi/v1/order", params)
 
 
-def place_sl_tp(symbol, position_amt, entry_price, sl_dollar, tp_dollar):
-    """Places closePosition STOP_MARKET + TAKE_PROFIT_MARKET orders sized off the
-    actual open position (not off the qty of any single leg), so a 2nd entry
-    that changes the average price/size is handled correctly."""
+def place_protective_orders(symbol, position_amt, entry_price, sl_dollar, tp_dollar):
+    """Places a full-size closePosition STOP_MARKET (the $75 stop), plus a
+    half-size TAKE_PROFIT_MARKET with an exact quantity (NOT closePosition).
+    That second order executes automatically on Binance's own engine the
+    instant price hits it -- it doesn't wait for a TradingView alert. Once it
+    fires, Pine detects the same event on its next bar close and sends a
+    PARTIAL_TP notification so we can move the remaining stop up to lock it."""
     if position_amt == 0:
         return {"skipped": "flat"}
 
     is_long = position_amt > 0
     abs_qty = abs(position_amt)
+    half_qty = format_qty(symbol, abs_qty / 2)
     price_offset_sl = sl_dollar / abs_qty
     price_offset_tp = tp_dollar / abs_qty
 
@@ -126,12 +155,14 @@ def place_sl_tp(symbol, position_amt, entry_price, sl_dollar, tp_dollar):
             "side": exit_side,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": target_price,
-            "closePosition": "true",
+            "quantity": half_qty,
+            "reduceOnly": "true",
         },
     )
     return {
         "stop_price": stop_price,
         "target_price": target_price,
+        "half_qty": half_qty,
         "sl_response": sl_resp.json(),
         "tp_response": tp_resp.json(),
     }
@@ -139,7 +170,12 @@ def place_sl_tp(symbol, position_amt, entry_price, sl_dollar, tp_dollar):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Binance Futures Testnet Webhook is Live!"
+    key_status = f"...{API_KEY[-4:]}" if API_KEY else "NOT SET"
+    secret_status = "set" if API_SECRET else "NOT SET"
+    return (
+        "Binance Demo Trading Webhook is Live! "
+        f"| API key ends: {key_status} | API secret: {secret_status}"
+    )
 
 
 @app.route("/webhook", methods=["POST"])
@@ -165,12 +201,19 @@ def webhook():
         elif action == "ENTRY":
             side = tv_data.get("side").upper()
             qty = tv_data.get("qty")
-            sl_dollar = float(tv_data.get("sl_dollar", 50))
+            sl_dollar = float(tv_data.get("sl_dollar", 75))
             tp_dollar = float(tv_data.get("tp_dollar", 150))
+
+            max_qty = MAX_QTY.get(symbol)
+            if max_qty is not None and float(qty) > max_qty:
+                msg = f"Rejected: qty {qty} exceeds safety cap of {max_qty} for {symbol}. Raise MAX_QTY in index.py if this is intentional."
+                print(f"ENTRY BLOCKED BY SAFETY CAP: {msg}")
+                return jsonify({"status": "error", "error": msg}), 400
 
             # Clear any stale SL/TP from a prior leg before placing new ones
             cancel_open_orders(symbol)
 
+            print(f"PLACING ENTRY: symbol={symbol} side={side} raw_qty={qty} formatted_qty={format_qty(symbol, qty)}")
             entry_resp = place_market_order(symbol, side, qty)
             if entry_resp.status_code >= 400:
                 print(f"ENTRY ORDER FAILED: {entry_resp.status_code} - {entry_resp.text}")
@@ -180,7 +223,7 @@ def webhook():
             # authoritative average entry price / size and place SL+TP off that.
             time.sleep(0.5)
             position_amt, entry_price = get_position(symbol)
-            risk_result = place_sl_tp(symbol, position_amt, entry_price, sl_dollar, tp_dollar)
+            risk_result = place_protective_orders(symbol, position_amt, entry_price, sl_dollar, tp_dollar)
 
             return jsonify(
                 {
@@ -190,6 +233,96 @@ def webhook():
                     "position_amt": position_amt,
                     "entry_price": entry_price,
                     "risk_orders": risk_result,
+                }
+            ), 200
+
+        elif action == "PARTIAL_TP":
+            # The native half-size TAKE_PROFIT_MARKET order (placed in
+            # place_protective_orders at ENTRY time) already executed the
+            # actual partial close on Binance. This alert just tells us to
+            # now move the remaining stop up to lock that level in.
+            target_dollar = float(tv_data.get("target_dollar", 150))
+            position_amt, entry_price = get_position(symbol)
+            if position_amt == 0:
+                return jsonify({"status": "success", "action": "PARTIAL_TP", "note": "already flat"}), 200
+
+            is_long = position_amt > 0
+            remaining_qty = abs(position_amt)
+            # remaining_qty is ~half of the original size, so target_dollar/2
+            # divided by remaining_qty reproduces the exact price level where
+            # the ORIGINAL full position would have made target_dollar.
+            lock_offset = (target_dollar / 2) / remaining_qty
+            lock_price = entry_price + lock_offset if is_long else entry_price - lock_offset
+            lock_price = round_price(symbol, lock_price)
+            exit_side = "SELL" if is_long else "BUY"
+
+            cancel_open_orders(symbol)
+            stop_resp = signed_request(
+                "POST",
+                "/fapi/v1/order",
+                {
+                    "symbol": symbol,
+                    "side": exit_side,
+                    "type": "STOP_MARKET",
+                    "stopPrice": lock_price,
+                    "closePosition": "true",
+                },
+            )
+            print(f"PARTIAL_TP: locked stop at {lock_price} for remaining_qty={remaining_qty}")
+            return jsonify(
+                {
+                    "status": "success",
+                    "action": "PARTIAL_TP",
+                    "remaining_qty": remaining_qty,
+                    "entry_price": entry_price,
+                    "lock_price": lock_price,
+                    "stop_response": stop_resp.json(),
+                }
+            ), 200
+
+        elif action == "TRAIL_STEP":
+            # Moves the existing locked stop forward by another increment,
+            # based on whatever the CURRENT resting stop price already is --
+            # so Binance's own open order is the persisted state, and this
+            # webhook doesn't need to remember how many steps happened before.
+            step_dollar = float(tv_data.get("step_dollar", 100))
+            position_amt, entry_price = get_position(symbol)
+            if position_amt == 0:
+                return jsonify({"status": "success", "action": "TRAIL_STEP", "note": "already flat"}), 200
+
+            is_long = position_amt > 0
+            remaining_qty = abs(position_amt)
+            trail_increment = (step_dollar / 2) / remaining_qty
+
+            open_orders_resp = signed_request("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+            open_orders = open_orders_resp.json()
+            stop_orders = [o for o in open_orders if o.get("type") == "STOP_MARKET"]
+            base_price = float(stop_orders[0]["stopPrice"]) if stop_orders else entry_price
+
+            new_stop = base_price + trail_increment if is_long else base_price - trail_increment
+            new_stop = round_price(symbol, new_stop)
+            exit_side = "SELL" if is_long else "BUY"
+
+            cancel_open_orders(symbol)
+            stop_resp = signed_request(
+                "POST",
+                "/fapi/v1/order",
+                {
+                    "symbol": symbol,
+                    "side": exit_side,
+                    "type": "STOP_MARKET",
+                    "stopPrice": new_stop,
+                    "closePosition": "true",
+                },
+            )
+            print(f"TRAIL_STEP: moved stop {base_price} -> {new_stop}")
+            return jsonify(
+                {
+                    "status": "success",
+                    "action": "TRAIL_STEP",
+                    "old_stop": base_price,
+                    "new_stop": new_stop,
+                    "stop_response": stop_resp.json(),
                 }
             ), 200
 
