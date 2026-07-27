@@ -2,6 +2,7 @@ import os
 import time
 import hmac
 import hashlib
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import requests
@@ -168,6 +169,28 @@ def place_protective_orders(symbol, position_amt, entry_price, sl_dollar, tp_dol
     }
 
 
+def get_income_history(symbol, start_time_ms, end_time_ms):
+    """Pages through Binance's income ledger (realized PnL, commission,
+    funding fees) between two timestamps. Capped at 10 pages (10,000
+    records) as a sanity limit -- plenty for a multi-day report."""
+    all_records = []
+    cursor = start_time_ms
+    for _ in range(10):
+        resp = signed_request(
+            "GET",
+            "/fapi/v1/income",
+            {"symbol": symbol, "startTime": cursor, "endTime": end_time_ms, "limit": 1000},
+        )
+        page = resp.json()
+        if not isinstance(page, list) or len(page) == 0:
+            break
+        all_records.extend(page)
+        if len(page) < 1000:
+            break
+        cursor = page[-1]["time"] + 1
+    return all_records
+
+
 @app.route("/", methods=["GET"])
 def home():
     key_status = f"...{API_KEY[-4:]}" if API_KEY else "NOT SET"
@@ -331,4 +354,67 @@ def webhook():
 
     except Exception as e:
         print(f"ERROR: {e}")
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/report", methods=["GET"])
+def report():
+    """Visit e.g. /report?symbol=BTCUSDT&days=4 in a browser. Pulls realized
+    PnL / commission / funding directly from Binance's own income ledger --
+    the real, authoritative numbers, not a reconstruction from trade history.
+    Demo Trading keeps this data for the same account as your live trades."""
+    try:
+        symbol = request.args.get("symbol", "BTCUSDT").upper()
+        days = float(request.args.get("days", "4"))
+        end_time_ms = int(time.time() * 1000)
+        start_time_ms = end_time_ms - int(days * 86400 * 1000)
+
+        records = get_income_history(symbol, start_time_ms, end_time_ms)
+
+        realized = [r for r in records if r.get("incomeType") == "REALIZED_PNL"]
+        commission = [r for r in records if r.get("incomeType") == "COMMISSION"]
+        funding = [r for r in records if r.get("incomeType") == "FUNDING_FEE"]
+
+        total_realized = sum(float(r["income"]) for r in realized)
+        total_commission = sum(float(r["income"]) for r in commission)
+        total_funding = sum(float(r["income"]) for r in funding)
+        net_pnl = total_realized + total_commission + total_funding
+
+        wins = [r for r in realized if float(r["income"]) > 0]
+        losses = [r for r in realized if float(r["income"]) < 0]
+        win_rate = (len(wins) / len(realized) * 100) if realized else 0.0
+
+        recent = sorted(realized, key=lambda r: r["time"], reverse=True)[:25]
+        rows_html = ""
+        for r in recent:
+            ts = datetime.fromtimestamp(r["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            amt = float(r["income"])
+            color = "green" if amt >= 0 else "crimson"
+            rows_html += f"<tr><td>{ts}</td><td>{r.get('symbol', '')}</td><td style='color:{color}'>{amt:+.4f} USDT</td></tr>"
+
+        realized_color = "green" if total_realized >= 0 else "crimson"
+        net_color = "green" if net_pnl >= 0 else "crimson"
+
+        html = f"""
+        <html><head><title>Performance Report</title></head>
+        <body style="font-family: -apple-system, Arial, sans-serif; padding: 24px; max-width: 700px;">
+        <h2>Performance Report -- {symbol}</h2>
+        <p>Window: last {days:g} day(s), UTC (Binance income ledger only keeps ~3 months of history)</p>
+        <table cellpadding="6" style="border-collapse: collapse;">
+          <tr><td>Realized PnL</td><td style="color:{realized_color}">{total_realized:+.4f} USDT</td></tr>
+          <tr><td>Commission paid</td><td style="color:crimson">{total_commission:.4f} USDT</td></tr>
+          <tr><td>Funding fees</td><td>{total_funding:+.4f} USDT</td></tr>
+          <tr><td><b>Net PnL</b></td><td style="color:{net_color}"><b>{net_pnl:+.4f} USDT</b></td></tr>
+          <tr><td>Realized-PnL events</td><td>{len(realized)} total &mdash; {len(wins)} win / {len(losses)} loss ({win_rate:.1f}% win rate)</td></tr>
+        </table>
+        <h3>Most recent {len(recent)} realized-PnL events</h3>
+        <table border="1" cellpadding="6" style="border-collapse: collapse;">
+          <tr><th>Time</th><th>Symbol</th><th>Realized PnL</th></tr>
+          {rows_html}
+        </table>
+        </body></html>
+        """
+        return html, 200
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 400
