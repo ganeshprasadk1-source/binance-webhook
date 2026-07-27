@@ -395,11 +395,20 @@ def report():
         realized_color = "green" if total_realized >= 0 else "crimson"
         net_color = "green" if net_pnl >= 0 else "crimson"
 
+        start_str = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        end_str = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if realized:
+            oldest_str = datetime.fromtimestamp(min(r["time"] for r in realized) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            oldest_note = f"Oldest realized-PnL event actually found: {oldest_str}"
+        else:
+            oldest_note = "No realized-PnL events found in this window."
+
         html = f"""
         <html><head><title>Performance Report</title></head>
         <body style="font-family: -apple-system, Arial, sans-serif; padding: 24px; max-width: 700px;">
         <h2>Performance Report -- {symbol}</h2>
-        <p>Window: last {days:g} day(s), UTC (Binance income ledger only keeps ~3 months of history)</p>
+        <p>Queried range: {start_str} &rarr; {end_str} ({days:g} day(s) requested)</p>
+        <p>{oldest_note}</p>
         <table cellpadding="6" style="border-collapse: collapse;">
           <tr><td>Realized PnL</td><td style="color:{realized_color}">{total_realized:+.4f} USDT</td></tr>
           <tr><td>Commission paid</td><td style="color:crimson">{total_commission:.4f} USDT</td></tr>
