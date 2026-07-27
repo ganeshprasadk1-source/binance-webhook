@@ -384,6 +384,35 @@ def report():
         losses = [r for r in realized if float(r["income"]) < 0]
         win_rate = (len(wins) / len(realized) * 100) if realized else 0.0
 
+        # Daily breakdown with a running cumulative net total
+        from collections import defaultdict
+        daily = defaultdict(lambda: {"realized": 0.0, "commission": 0.0, "funding": 0.0, "trades": 0})
+        for r in realized:
+            d = datetime.fromtimestamp(r["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            daily[d]["realized"] += float(r["income"])
+            daily[d]["trades"] += 1
+        for r in commission:
+            d = datetime.fromtimestamp(r["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            daily[d]["commission"] += float(r["income"])
+        for r in funding:
+            d = datetime.fromtimestamp(r["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            daily[d]["funding"] += float(r["income"])
+
+        daily_rows_html = ""
+        cumulative = 0.0
+        for d in sorted(daily.keys()):
+            row = daily[d]
+            day_net = row["realized"] + row["commission"] + row["funding"]
+            cumulative += day_net
+            day_color = "green" if day_net >= 0 else "crimson"
+            cum_color = "green" if cumulative >= 0 else "crimson"
+            daily_rows_html += (
+                f"<tr><td>{d}</td><td>{row['trades']}</td>"
+                f"<td>{row['realized']:+.4f}</td><td>{row['commission']:.4f}</td><td>{row['funding']:+.4f}</td>"
+                f"<td style='color:{day_color}'><b>{day_net:+.4f}</b></td>"
+                f"<td style='color:{cum_color}'><b>{cumulative:+.4f}</b></td></tr>"
+            )
+
         recent = sorted(realized, key=lambda r: r["time"], reverse=True)[:25]
         rows_html = ""
         for r in recent:
@@ -405,7 +434,7 @@ def report():
 
         html = f"""
         <html><head><title>Performance Report</title></head>
-        <body style="font-family: -apple-system, Arial, sans-serif; padding: 24px; max-width: 700px;">
+        <body style="font-family: -apple-system, Arial, sans-serif; padding: 24px; max-width: 750px;">
         <h2>Performance Report -- {symbol}</h2>
         <p>Queried range: {start_str} &rarr; {end_str} ({days:g} day(s) requested)</p>
         <p>{oldest_note}</p>
@@ -415,6 +444,11 @@ def report():
           <tr><td>Funding fees</td><td>{total_funding:+.4f} USDT</td></tr>
           <tr><td><b>Net PnL</b></td><td style="color:{net_color}"><b>{net_pnl:+.4f} USDT</b></td></tr>
           <tr><td>Realized-PnL events</td><td>{len(realized)} total &mdash; {len(wins)} win / {len(losses)} loss ({win_rate:.1f}% win rate)</td></tr>
+        </table>
+        <h3>Daily breakdown (cumulative)</h3>
+        <table border="1" cellpadding="6" style="border-collapse: collapse;">
+          <tr><th>Date (UTC)</th><th>Trades</th><th>Realized</th><th>Commission</th><th>Funding</th><th>Net (day)</th><th>Cumulative</th></tr>
+          {daily_rows_html}
         </table>
         <h3>Most recent {len(recent)} realized-PnL events</h3>
         <table border="1" cellpadding="6" style="border-collapse: collapse;">
